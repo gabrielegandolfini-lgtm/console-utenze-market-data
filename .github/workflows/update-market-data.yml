@@ -63,3 +63,5 @@ jobs:
 
           git branch -M data
           git push --force origin data
+
+# Relay test: direct ARERA access with proxy fallback
