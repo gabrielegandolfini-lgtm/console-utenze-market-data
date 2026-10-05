@@ -2,133 +2,160 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import sys
-from datetime import datetime, timezone
-from html.parser import HTMLParser
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urljoin
+from typing import Dict, Tuple
 
 import requests
 
-OPEN_DATA_PAGE = "https://www.ilportaleofferte.it/portaleOfferte/it/open-data.page"
+BASE = "https://www.ilportaleofferte.it/portaleOfferte/resources/opendata/csv"
 OUT = Path("data/latest")
-TIMEOUT = 90
+TIMEOUT = 120
+LOOKBACK_DAYS = 14
 
-class LinkParser(HTMLParser):
-    def __init__(self):
-        super().__init__()
-        self.links = []
-        self._href = None
-        self._text = []
-    def handle_starttag(self, tag, attrs):
-        if tag.lower() == "a":
-            self._href = dict(attrs).get("href")
-            self._text = []
-    def handle_data(self, data):
-        if self._href is not None:
-            self._text.append(data)
-    def handle_endtag(self, tag):
-        if tag.lower() == "a" and self._href is not None:
-            text = " ".join("".join(self._text).split())
-            self.links.append((self._href, text))
-            self._href = None
-            self._text = []
+# The current official Open Data page currently points to the 10/08/2026 dataset.
+# This is used only as a fallback when the current-day direct files are not yet published.
+KNOWN_OFFICIAL_SNAPSHOT = "20260810"
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/140.0 Safari/537.36",
+    "Accept": "application/xml,text/xml,text/csv,text/plain,*/*",
+    "Accept-Language": "it-IT,it;q=0.9,en;q=0.8",
+    "Referer": "https://www.ilportaleofferte.it/portaleOfferte/it/open-data.page",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+}
 
 
-def fetch(url: str, *, stream: bool = False) -> requests.Response:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; Console-Utenze-Market-Relay/1.0)",
-        "Accept": "text/html,application/xml,text/xml,text/csv,text/plain,*/*",
-        "Accept-Language": "it-IT,it;q=0.9,en;q=0.8",
+def compact_date(d: date) -> str:
+    return d.strftime("%Y%m%d")
+
+
+def urls_for(ds: str) -> Dict[str, str]:
+    y = ds[:4]
+    m = str(int(ds[4:6]))
+    ym = f"{y}_{m}"
+    return {
+        "electricXml": f"{BASE}/offerteML/{ym}/PO_Offerte_E_MLIBERO_{ds}.xml",
+        "gasXml": f"{BASE}/offerteML/{ym}/PO_Offerte_G_MLIBERO_{ds}.xml",
+        "dualXml": f"{BASE}/offerteML/{ym}/PO_Offerte_D_MLIBERO_{ds}.xml",
+        "electricParam": f"{BASE}/parametriML/{ym}/PO_Parametri_Mercato_Libero_E_{ds}.csv",
+        "gasParam": f"{BASE}/parametriML/{ym}/PO_Parametri_Mercato_Libero_G_{ds}.csv",
     }
-    r = requests.get(url, headers=headers, timeout=TIMEOUT, stream=stream)
-    r.raise_for_status()
-    return r
 
 
-def classify(links):
-    picked = {}
-    for href, text in links:
-        url = urljoin(OPEN_DATA_PAGE, href)
-        low = url.lower()
-        t = text.lower()
-        if "po_offerte_e_mlibero_" in low and low.endswith(".xml"):
-            picked["electricXml"] = url
-        elif "po_offerte_g_mlibero_" in low and low.endswith(".xml"):
-            picked["gasXml"] = url
-        elif "po_offerte_d_mlibero_" in low and low.endswith(".xml"):
-            picked["dualXml"] = url
-        elif "po_parametri_mercato_libero_e_" in low and low.endswith(".csv"):
-            picked["electricParam"] = url
-        elif "po_parametri_mercato_libero_g_" in low and low.endswith(".csv"):
-            picked["gasParam"] = url
-        elif "prezzi storici" in t and low.endswith(".csv"):
-            picked["historical"] = url
-    return picked
+def probe(session: requests.Session, url: str) -> Tuple[int, str]:
+    try:
+        r = session.get(url, timeout=TIMEOUT, allow_redirects=True, stream=True)
+        code = r.status_code
+        ctype = r.headers.get("Content-Type", "")
+        r.close()
+        return code, ctype
+    except Exception as exc:
+        print(f"PROBE ERROR {url}: {exc}")
+        return 0, ""
 
 
-def dataset_date(urls):
-    vals = []
-    for u in urls.values():
-        m = re.search(r"(20\d{6})", u)
-        if m:
-            try:
-                vals.append(datetime.strptime(m.group(1), "%Y%m%d").date())
-            except ValueError:
-                pass
-    return max(vals).isoformat() if vals else ""
+def find_snapshot(session: requests.Session):
+    candidates = []
+    today = date.today()
+    for i in range(LOOKBACK_DAYS + 1):
+        candidates.append(compact_date(today - timedelta(days=i)))
+    if KNOWN_OFFICIAL_SNAPSHOT not in candidates:
+        candidates.append(KNOWN_OFFICIAL_SNAPSHOT)
+
+    diagnostics = []
+    for ds in candidates:
+        u = urls_for(ds)
+        ec, ect = probe(session, u["electricXml"])
+        gc, gct = probe(session, u["gasXml"])
+        diagnostics.append({
+            "date": ds,
+            "electricXml": ec,
+            "gasXml": gc,
+            "electricContentType": ect,
+            "gasContentType": gct,
+        })
+        print(f"{ds}: XML E={ec}, XML G={gc}")
+        if 200 <= ec < 300 and 200 <= gc < 300:
+            return ds, u, diagnostics
+
+    raise RuntimeError(
+        "Nessun dataset ufficiale diretto raggiungibile. "
+        + json.dumps(diagnostics, ensure_ascii=False)
+    )
 
 
-def download(url: str, path: Path):
-    r = fetch(url, stream=True)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("wb") as f:
-        for chunk in r.iter_content(chunk_size=1024 * 1024):
-            if chunk:
-                f.write(chunk)
+def download(session: requests.Session, url: str, path: Path) -> bool:
+    try:
+        with session.get(url, timeout=TIMEOUT, allow_redirects=True, stream=True) as r:
+            print(f"DOWNLOAD {url} -> HTTP {r.status_code}")
+            if not (200 <= r.status_code < 300):
+                return False
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("wb") as f:
+                for chunk in r.iter_content(1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+            return True
+    except Exception as exc:
+        print(f"DOWNLOAD ERROR {url}: {exc}")
+        return False
 
 
 def main():
-    print(f"Reading {OPEN_DATA_PAGE}")
-    page = fetch(OPEN_DATA_PAGE).text
-    parser = LinkParser()
-    parser.feed(page)
-    urls = classify(parser.links)
-    required = ("electricXml", "gasXml")
-    missing = [k for k in required if k not in urls]
-    if missing:
-        raise RuntimeError(f"Missing required datasets: {', '.join(missing)}")
+    session = requests.Session()
+    session.headers.update(HEADERS)
 
-    # Clean only the generated data branch contents.
+    ds, urls, diagnostics = find_snapshot(session)
+    print(f"Selected official dataset: {ds}")
+
     OUT.mkdir(parents=True, exist_ok=True)
     for p in OUT.iterdir():
         if p.is_file():
             p.unlink()
 
-    file_map = {}
-    for key, url in urls.items():
-        ext = ".csv" if url.lower().endswith(".csv") else ".xml"
-        local = OUT / f"{key}{ext}"
-        print(f"Downloading {key}: {url}")
-        download(url, local)
-        file_map[key] = local.as_posix()
+    files = {}
+    warnings = []
+
+    mapping = {
+        "electricXml": "electric.xml",
+        "gasXml": "gas.xml",
+        "dualXml": "dual.xml",
+        "electricParam": "electricParam.csv",
+        "gasParam": "gasParam.csv",
+    }
+
+    for key, filename in mapping.items():
+        ok = download(session, urls[key], OUT / filename)
+        if ok:
+            files[key] = f"data/latest/{filename}"
+        elif key in ("electricXml", "gasXml"):
+            raise RuntimeError(f"Download obbligatorio fallito: {key} -> {urls[key]}")
+        else:
+            warnings.append(f"{key} non disponibile: {urls[key]}")
 
     manifest = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "generatedAt": datetime.now(timezone.utc).isoformat(),
-        "sourcePage": OPEN_DATA_PAGE,
-        "sourceUpdatedAt": dataset_date(urls),
-        "files": file_map,
+        "sourcePage": "https://www.ilportaleofferte.it/portaleOfferte/it/open-data.page",
+        "sourceUpdatedAt": f"{ds[:4]}-{ds[4:6]}-{ds[6:8]}",
         "sourceUrls": urls,
-        "notes": [
-            "Files downloaded by GitHub Actions from the official Portale Offerte Open Data page.",
-            "The Apps Script console reads these files from the GitHub relay because direct UrlFetchApp calls to the Portale Offerte can receive HTTP 403."
-        ]
+        "files": files,
+        "warnings": warnings,
+        "diagnostics": diagnostics,
+        "relay": "GitHub Actions",
     }
-    (OUT / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    (OUT / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
     print(json.dumps(manifest, indent=2, ensure_ascii=False))
+
 
 if __name__ == "__main__":
     try:
