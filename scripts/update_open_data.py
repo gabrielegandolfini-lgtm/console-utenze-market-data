@@ -47,16 +47,28 @@ def urls_for(ds: str) -> Dict[str, str]:
     }
 
 
+def proxy_url(url: str) -> str:
+    # Fallback: a public raw proxy. The official Portale Offerte blocks
+    # requests originating from GitHub-hosted runners with HTTP 403.
+    from urllib.parse import quote
+    return "https://api.allorigins.win/raw?url=" + quote(url, safe="")
+
+
 def probe(session: requests.Session, url: str) -> Tuple[int, str]:
-    try:
-        r = session.get(url, timeout=TIMEOUT, allow_redirects=True, stream=True)
-        code = r.status_code
-        ctype = r.headers.get("Content-Type", "")
-        r.close()
-        return code, ctype
-    except Exception as exc:
-        print(f"PROBE ERROR {url}: {exc}")
-        return 0, ""
+    for candidate in (url, proxy_url(url)):
+        try:
+            r = session.get(candidate, timeout=TIMEOUT, allow_redirects=True, stream=True)
+            code = r.status_code
+            ctype = r.headers.get("Content-Type", "")
+            # We only need the proxy if the direct official URL is blocked.
+            r.close()
+            if code == 200:
+                return code, ctype
+            if candidate != url:
+                print(f"PROXY PROBE {url} -> HTTP {code}")
+        except Exception as exc:
+            print(f"PROBE ERROR {candidate}: {exc}")
+    return 0, ""
 
 
 def find_snapshot(session: requests.Session):
@@ -90,20 +102,26 @@ def find_snapshot(session: requests.Session):
 
 
 def download(session: requests.Session, url: str, path: Path) -> bool:
-    try:
-        with session.get(url, timeout=TIMEOUT, allow_redirects=True, stream=True) as r:
-            print(f"DOWNLOAD {url} -> HTTP {r.status_code}")
-            if not (200 <= r.status_code < 300):
-                return False
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("wb") as f:
-                for chunk in r.iter_content(1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            return True
-    except Exception as exc:
-        print(f"DOWNLOAD ERROR {url}: {exc}")
-        return False
+    candidates = [(url, "direct"), (proxy_url(url), "proxy")]
+    for candidate, label in candidates:
+        try:
+            with session.get(candidate, timeout=TIMEOUT, allow_redirects=True, stream=True) as r:
+                print(f"DOWNLOAD {label} {url} -> HTTP {r.status_code}")
+                if not (200 <= r.status_code < 300):
+                    continue
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("wb") as f:
+                    for chunk in r.iter_content(1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+                if path.stat().st_size < 1000:
+                    print(f"WARNING: {label} returned an unexpectedly small file ({path.stat().st_size} bytes)")
+                    path.unlink(missing_ok=True)
+                    continue
+                return True
+        except Exception as exc:
+            print(f"DOWNLOAD ERROR {label} {url}: {exc}")
+    return False
 
 
 def main():
@@ -147,7 +165,7 @@ def main():
         "files": files,
         "warnings": warnings,
         "diagnostics": diagnostics,
-        "relay": "GitHub Actions",
+        "relay": "GitHub Actions + direct/proxy fallback",
     }
 
     (OUT / "manifest.json").write_text(
