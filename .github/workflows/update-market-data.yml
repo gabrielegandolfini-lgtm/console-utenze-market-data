@@ -1,0 +1,60 @@
+name: Update Portale Offerte data
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 3 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install requests
+        run: python -m pip install --upgrade requests
+
+      - name: Download official Portale Offerte Open Data
+        run: python scripts/update_open_data.py
+
+      - name: Publish latest snapshot to data branch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if [ ! -d "data/latest" ]; then
+            echo "ERRORE: la cartella data/latest non è stata creata dallo script."
+            exit 1
+          fi
+
+          mkdir -p /tmp/market-data
+          cp -R data/latest/. /tmp/market-data/
+
+          git fetch origin data:data 2>/dev/null || true
+
+          git switch --orphan data-publish
+          git rm -rf . >/dev/null 2>&1 || true
+
+          mkdir -p data/latest
+          cp -R /tmp/market-data/. data/latest/
+
+          git add data/latest
+          git commit -m "Update Portale Offerte market snapshot"
+
+          git branch -M data
+          git push --force origin data
