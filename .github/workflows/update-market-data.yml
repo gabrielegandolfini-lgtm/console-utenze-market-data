@@ -1,6 +1,11 @@
 name: Update Portale Offerte data
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/**'
+      - '.github/workflows/**'
   workflow_dispatch:
   schedule:
     - cron: '30 3 * * *'
